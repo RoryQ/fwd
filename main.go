@@ -7,43 +7,34 @@ import (
 	"flag"
 	"fmt"
 	"io/ioutil"
-	"log"
 	"net/http"
 	"os"
 )
 
-var sourceArg = flag.String("source", "", "smee.io channel url")
-var targetArg = flag.String("target", "", "forwarding target")
+var (
+	sourceArg = flag.String("source", "", "smee.io channel url")
+	targetArg = flag.String("target", "", "forwarding target")
+	debugArg  = flag.Bool("debug", false, "debug logging")
+)
 
 func main() {
 	flag.Parse()
 	source := parseSource()
-
 	fmt.Println("Subscribing to smee source: " + source)
 
 	ch := make(chan SSEvent)
 	client := NewSmeeClient(source, ch)
-
 	fmt.Println("Client initialised")
 
 	sub, err := client.Start()
 	if err != nil {
 		panic(err)
 	}
-
-	fwder := NewFwder()
-
 	fmt.Println("Client running")
 
-	for ev := range ch {
-		fwder.Receive(ev)
-	}
+	NewFwder().Start(ch)
 
 	sub.Stop()
-}
-
-func NewFwder() Fwder {
-	return Fwder{target: parseTarget(), client: http.DefaultClient}
 }
 
 func parseTarget() string {
@@ -67,13 +58,26 @@ func parseSource() string {
 	return *sourceArg
 }
 
+func NewFwder() *Fwder {
+	return &Fwder{target: parseTarget(), client: http.DefaultClient}
+}
+
 type Fwder struct {
 	target string
 	client *http.Client
 }
 
+func (f *Fwder) Start(stream <-chan SSEvent) {
+	for ev := range stream {
+		f.Receive(ev)
+	}
+}
+
 func (f *Fwder) Receive(ev SSEvent) {
 	if ev.Name == "ping" || f.target == "" {
+		if *debugArg {
+			fmt.Printf("Received event: id=%v, name=%v, payload=%v\n", ev.Id, ev.Name, string(ev.Data))
+		}
 		return
 	}
 
@@ -82,7 +86,14 @@ func (f *Fwder) Receive(ev SSEvent) {
 	var p Payload
 	json.Unmarshal(ev.Data, &p)
 
-	resp, err := f.client.Post(f.target, p.ContentType, ioutil.NopCloser(bytes.NewReader(p.Body)))
+	req, _ := http.NewRequest("POST", f.target, ioutil.NopCloser(bytes.NewReader(p.Body)))
+	req.Header.Add("content-type", p.ContentType)
+	req.Header.Add("x-request-id", p.XRequestID)
+	req.Header.Add("x-github-delivery", p.XGithubDelivery)
+	req.Header.Add("x-github-event", p.XGithubEvent)
+	req.Header.Add("x-hub-signature", p.XHubSignature)
+
+	resp, err := f.client.Do(req)
 	if err != nil {
 		fmt.Println(err)
 	}
@@ -94,22 +105,23 @@ func (f *Fwder) Receive(ev SSEvent) {
 }
 
 type Payload struct {
-	Host string
-	Connection string
-	UserAgent string `json:"user-agent"`
-	AcceptEncoding string `json:"accept-encoding"`
-	Accept string
-	ContentType string `json:"content-type"`
-	XRequestID string `json:"x-request-id"`
-	Body json.RawMessage
-	Timestamp int64
+	Host            string
+	Connection      string
+	UserAgent       string `json:"user-agent"`
+	AcceptEncoding  string `json:"accept-encoding"`
+	Accept          string
+	ContentType     string `json:"content-type"`
+	XRequestID      string `json:"x-request-id"`
+	XGithubDelivery string `json:"x-github-delivery"`
+	XGithubEvent    string `json:"x-github-event"`
+	XHubSignature   string `json:"x-hub-signature"`
+	Body            json.RawMessage
+	Timestamp       int64
 }
-
 
 type SmeeClient struct {
 	source string
 	target chan<- SSEvent
-	logger *log.Logger
 }
 
 func CreateSmeeChannel() (string, error) {
@@ -162,7 +174,6 @@ func NewSmeeClient(source string, target chan<- SSEvent) *SmeeClient {
 	return &SmeeClient{
 		source: source,
 		target: target,
-		logger: new(log.Logger),
 	}
 }
 
