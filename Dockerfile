@@ -1,10 +1,11 @@
 FROM golang:alpine as builder
 
-COPY main.go .
+WORKDIR /workspace
+COPY main.go go.mod go.sum ./
 RUN go build -o smee main.go
 
 FROM alpine as runtime
-COPY --from=builder /go/smee .
+COPY --from=builder /workspace/smee .
 
 ENTRYPOINT ["./smee"]
 

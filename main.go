@@ -4,37 +4,74 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net/http"
 	"os"
+	"strconv"
+
+	"gopkg.in/thejerf/suture.v2"
+)
+
+const (
+	defaultConfigPath = "~/.config/fwd/fwd.json"
 )
 
 var (
-	sourceArg = flag.String("source", "", "smee.io channel url")
-	targetArg = flag.String("target", "", "forwarding target")
-	debugArg  = flag.Bool("debug", false, "debug logging")
+	sourceArg     = flag.String("source", "", "smee.io channel url")
+	targetArg     = flag.String("target", "", "forwarding target")
+	configPathArg = flag.String("config", defaultConfigPath, "path to config")
+	debugArg      = flag.Bool("debug", false, "debug logging")
 )
 
 func main() {
 	flag.Parse()
-	source := parseSource()
-	fmt.Println("Subscribing to smee source: " + source)
+	supervisor := suture.NewSimple("Supervisor")
 
-	ch := make(chan SSEvent)
-	client := NewSmeeClient(source, ch)
-	fmt.Println("Client initialised")
+	var c int
 
-	sub, err := client.Start()
-	if err != nil {
-		panic(err)
+	s, t := parseSource(), parseTarget()
+	if s != "" && t != "" {
+		// single target mode
+		fwd := NewFwder(parseSource(), parseTarget())
+		supervisor.Add(fwd)
+		c += 1
 	}
-	fmt.Println("Client running")
 
-	NewFwder().Start(ch)
+	config := parseConfig()
+	for k, v := range config.Routes {
+		supervisor.Add(NewFwder(k, v))
+		c += 1
+	}
 
-	sub.Stop()
+	fmt.Printf("%d routes loaded\n", c)
+	supervisor.Serve()
+}
+
+type Config struct {
+	Routes map[string]string
+}
+
+func parseConfig() Config {
+	bytes, err := ioutil.ReadFile(*configPathArg)
+	config := Config{}
+	if errors.Is(err, os.ErrNotExist) && *configPathArg == defaultConfigPath {
+		return config
+	}
+
+	if err != nil {
+		fmt.Printf("error reading file: %s\n", err)
+		return config
+	}
+
+	err = json.Unmarshal(bytes, &config)
+	if err != nil {
+		fmt.Printf("error parsing file: %s\n", err)
+	}
+	return config
 }
 
 func parseTarget() string {
@@ -48,33 +85,73 @@ func parseSource() string {
 	if s := os.Getenv("FWD_SOURCE"); s != "" {
 		return s
 	}
-	if *sourceArg == "" {
-		source, err := CreateSmeeChannel()
-		if err != nil {
-			panic(err)
-		}
-		return source
-	}
 	return *sourceArg
 }
 
-func NewFwder() *Fwder {
-	return &Fwder{target: parseTarget(), client: http.DefaultClient}
+func debugMode() bool {
+	if e := os.Getenv("FWD_DEBUG"); e != "" {
+		b, _ := strconv.ParseBool(e)
+		return b
+	}
+	return *debugArg
 }
 
-type Fwder struct {
-	target string
-	client *http.Client
+func createSmeeChannel() (string, error) {
+	httpClient := http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	resp, err := httpClient.Head("https://smee.io/new")
+	if err != nil {
+		return "", err
+	}
+
+	loc := resp.Header.Get("Location")
+	return loc, nil
 }
 
-func (f *Fwder) Start(stream <-chan SSEvent) {
-	for ev := range stream {
-		f.Receive(ev)
+func NewFwder(source, target string) *Fwder {
+	fmt.Printf("Forwarding source %s to target %s\n", source, target)
+	return &Fwder{
+		source: source,
+		target: target,
+		client: http.DefaultClient,
+		stop:   make(chan interface{}),
 	}
 }
 
-func (f *Fwder) Receive(ev SSEvent) {
-	if ev.Name == "ping" || f.target == "" {
+type Fwder struct {
+	source string
+	target string
+	client *http.Client
+
+	stop chan interface{}
+}
+
+func (f *Fwder) Serve() {
+	sub := NewSubscription(f.source)
+	super := suture.NewSimple("Fwder for " + f.source)
+	super.Add(sub)
+	super.ServeBackground()
+
+	for {
+		select {
+		case event := <-sub.Events:
+			f.Forward(event)
+		case <-f.stop:
+			sub.Stop()
+			return
+		}
+	}
+}
+
+func (f *Fwder) Stop() {
+	f.stop <- nil
+}
+
+func (f *Fwder) Forward(ev SSEvent) {
+	if ev.Name == "ping" || ev.Id == "" {
 		if *debugArg {
 			fmt.Printf("Received event: id=%v, name=%v, payload=%v\n", ev.Id, ev.Name, string(ev.Data))
 		}
@@ -97,11 +174,12 @@ func (f *Fwder) Receive(ev SSEvent) {
 	if err != nil {
 		fmt.Println(err)
 	}
-	if resp.StatusCode > 299 {
-		fmt.Println(resp.Body)
-	}
+	defer resp.Body.Close()
 
-	resp.Body.Close()
+	if debugMode() || resp.StatusCode > 299 {
+		b, _ := ioutil.ReadAll(resp.Body)
+		fmt.Printf("response code %s: %s\n", resp.Status, string(b))
+	}
 }
 
 type Payload struct {
@@ -119,132 +197,100 @@ type Payload struct {
 	Timestamp       int64
 }
 
-type SmeeClient struct {
-	source string
-	target chan<- SSEvent
-}
-
-func CreateSmeeChannel() (string, error) {
-	httpClient := http.Client{
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}
-	resp, err := httpClient.Head("https://smee.io/new")
-	if err != nil {
-		return "", err
-	}
-
-	loc := resp.Header.Get("Location")
-	return loc, nil
-}
-
-func (c *SmeeClient) Start() (*SmeeClientSubscription, error) {
-	eventStream, err := OpenSSEUrl(c.source)
-	if err != nil {
-		return nil, err
-	}
-
-	quit := make(chan interface{})
-	go c.run(eventStream, quit)
-
-	return &SmeeClientSubscription{terminator: quit}, nil
-}
-
-func (c *SmeeClient) run(sseEventStream <-chan SSEvent, quit <-chan interface{}) {
-	for {
-		select {
-		case event := <-sseEventStream:
-			c.target <- event
-		case <-quit:
-			return
-		}
-	}
-}
-
-type SmeeClientSubscription struct {
-	terminator chan<- interface{}
-}
-
-func (c *SmeeClientSubscription) Stop() {
-	c.terminator <- nil
-}
-
-func NewSmeeClient(source string, target chan<- SSEvent) *SmeeClient {
-	return &SmeeClient{
-		source: source,
-		target: target,
-	}
-}
-
 type SSEvent struct {
 	Id   string
 	Name string
 	Data []byte
 }
 
-func OpenSSEUrl(url string) (<-chan SSEvent, error) {
-	client := &http.Client{}
-	req, _ := http.NewRequest("GET", url, nil)
+type Subscription struct {
+	Events chan SSEvent
+	client *http.Client
+	url    string
+	stop   chan interface{}
+
+	// response body to be closed when restarting the service
+	bodyToClose io.Closer
+}
+
+func NewSubscription(url string) *Subscription {
+	return &Subscription{
+		Events: make(chan SSEvent),
+		client: &http.Client{},
+		url:    url,
+		stop:   make(chan interface{}),
+	}
+}
+
+func (s *Subscription) Stop() {
+	s.stop <- nil
+	s.bodyToClose.Close()
+}
+
+func (s *Subscription) Serve() {
+	req, _ := http.NewRequest("GET", s.url, nil)
 	req.Header.Set("Accept", "text/event-stream")
-	resp, err := client.Do(req)
+	resp, err := s.client.Do(req)
 	if err != nil {
-		return nil, err
+		panic(err)
 	}
 
 	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("Error: resp.StatusCode == %d\n", resp.StatusCode)
+		panic(fmt.Errorf("Error: resp.StatusCode == %d\n", resp.StatusCode))
 	}
 
 	if resp.Header.Get("Content-Type") != "text/event-stream" {
-		return nil, fmt.Errorf("Error: invalid Content-Type == %s\n", resp.Header.Get("Content-Type"))
+		panic(fmt.Errorf("Error: invalid Content-Type == %s\n", resp.Header.Get("Content-Type")))
 	}
 
-	events := make(chan SSEvent)
-
 	var buf bytes.Buffer
-
-	go func() {
-		ev := SSEvent{}
-		scanner := bufio.NewScanner(resp.Body)
-
-		for scanner.Scan() {
-			line := scanner.Bytes()
-
-			switch {
-
-			// start of event
-			case bytes.HasPrefix(line, []byte("id:")):
-				ev.Id = string(line[4:])
-
-				// event name
-			case bytes.HasPrefix(line, []byte("event:")):
-				ev.Name = string(line[7:])
-
-				// event data
-			case bytes.HasPrefix(line, []byte("data:")):
-				buf.Write(line[6:])
-
-				// end of event
-			case len(line) == 0:
-				ev.Data = buf.Bytes()
-				buf.Reset()
-				events <- ev
-				ev = SSEvent{}
-
-			default:
-				fmt.Fprintf(os.Stderr, "Error during EventReadLoop - Default triggerd! len:%d\n%s", len(line), line)
-				close(events)
-
-			}
+	ev := SSEvent{}
+	s.bodyToClose = resp.Body
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		select {
+		case <-s.stop:
+			return
+		default:
+			s.parseSend(scanner.Bytes(), &buf, &ev)
 		}
+	}
 
-		if err = scanner.Err(); err != nil {
-			fmt.Fprintf(os.Stderr, "Error during resp.Body read:%s\n", err)
-			close(events)
+	if err := scanner.Err(); err != nil {
+		panic(fmt.Errorf("error during resp.Body read: %w", err))
+	}
+}
 
-		}
-	}()
+// parseSend will build the event and when complete send and reset the buffer
+func (s *Subscription) parseSend(line []byte, buf *bytes.Buffer, ev *SSEvent) {
 
-	return events, nil
+	if debugMode() {
+		fmt.Printf("len: %d line: %s\n", len(line), string(line))
+	}
+
+	switch {
+
+	// start of event
+	case bytes.HasPrefix(line, []byte("id:")):
+		ev.Id = string(line[4:])
+
+	// event name
+	case bytes.HasPrefix(line, []byte("event:")):
+		ev.Name = string(line[7:])
+
+	// event data
+	case bytes.HasPrefix(line, []byte("data:")):
+		buf.Write(line[6:])
+
+	// end of event
+	case len(line) == 0:
+		ev.Data = buf.Bytes()
+		buf.Reset()
+		s.Events <- *ev
+		ev = &SSEvent{}
+
+	default:
+		//fmt.Fprintf(os.Stderr, "error during EventReadLoop - Default triggered! len:%d\n%s", len(line), line)
+		panic(fmt.Errorf("error during EventReadLoop - Default triggered! len:%d\n%s", len(line), line))
+	}
 }
