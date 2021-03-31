@@ -1,2 +1,4 @@
+github.com/thejerf/suture/v4 v4.0.0 h1:GX3X+1Qaewtj9flL2wgoTBfLA5NcmrCY39TJRpPbUrI=
+github.com/thejerf/suture/v4 v4.0.0/go.mod h1:g0e8vwskm9tI0jRjxrnA6lSr0q6OfPdWJVX7G5bVWRs=
 gopkg.in/thejerf/suture.v2 v2.0.3 h1:zG3zeEMyRI1NFmNOBy9r1bXZ9ZypnAZyoX70O7DczKU=
 gopkg.in/thejerf/suture.v2 v2.0.3/go.mod h1:QORUWWW7NDIvW1b2FkoiSvjrg5HGb2NEFnHYSNWLSSY=

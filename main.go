@@ -3,17 +3,20 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
+	"time"
 
-	"gopkg.in/thejerf/suture.v2"
+	"github.com/thejerf/suture/v4"
 )
 
 const (
@@ -21,14 +24,30 @@ const (
 )
 
 var (
-	sourceArg     = flag.String("source", "", "smee.io channel url")
-	targetArg     = flag.String("target", "", "forwarding target")
-	configPathArg = flag.String("config", defaultConfigPath, "path to config")
-	debugArg      = flag.Bool("debug", false, "debug logging")
+	sourceArg, targetArg, configPathArg string
+	debugArg                            bool
 )
 
-func main() {
+func init() {
+	flag.StringVar(&sourceArg, "source", "", "smee.io channel url")
+	flag.StringVar(&targetArg, "target", "", "forwarding target")
+	flag.StringVar(&configPathArg, "config", defaultConfigPath, "path to config")
+	flag.BoolVar(&debugArg, "debug", false, "debug logging")
 	flag.Parse()
+}
+
+func debugf(format string, args ...interface{}) {
+	if debugMode() {
+		fmt.Printf(format+"\n", args...)
+	}
+}
+
+func infof(format string, args ...interface{}) {
+	fmt.Printf(format+"\n", args...)
+}
+
+func main() {
+	ctx := context.Background()
 	supervisor := suture.NewSimple("Supervisor")
 
 	var c int
@@ -47,8 +66,8 @@ func main() {
 		c += 1
 	}
 
-	fmt.Printf("%d routes loaded\n", c)
-	supervisor.Serve()
+	infof("%d routes loaded", c)
+	supervisor.Serve(ctx)
 }
 
 type Config struct {
@@ -56,20 +75,20 @@ type Config struct {
 }
 
 func parseConfig() Config {
-	bytes, err := ioutil.ReadFile(*configPathArg)
+	bytes, err := ioutil.ReadFile(configPathArg)
 	config := Config{}
-	if errors.Is(err, os.ErrNotExist) && *configPathArg == defaultConfigPath {
+	if errors.Is(err, os.ErrNotExist) && configPathArg == defaultConfigPath {
 		return config
 	}
 
 	if err != nil {
-		fmt.Printf("error reading file: %s\n", err)
+		infof("error reading file: %s", err)
 		return config
 	}
 
 	err = json.Unmarshal(bytes, &config)
 	if err != nil {
-		fmt.Printf("error parsing file: %s\n", err)
+		infof("error parsing file: %s", err)
 	}
 	return config
 }
@@ -78,14 +97,14 @@ func parseTarget() string {
 	if t := os.Getenv("FWD_TARGET"); t != "" {
 		return t
 	}
-	return *targetArg
+	return targetArg
 }
 
 func parseSource() string {
 	if s := os.Getenv("FWD_SOURCE"); s != "" {
 		return s
 	}
-	return *sourceArg
+	return sourceArg
 }
 
 func debugMode() bool {
@@ -93,7 +112,7 @@ func debugMode() bool {
 		b, _ := strconv.ParseBool(e)
 		return b
 	}
-	return *debugArg
+	return debugArg
 }
 
 func createSmeeChannel() (string, error) {
@@ -112,12 +131,20 @@ func createSmeeChannel() (string, error) {
 }
 
 func NewFwder(source, target string) *Fwder {
-	fmt.Printf("Forwarding source %s to target %s\n", source, target)
 	return &Fwder{
 		source: source,
 		target: target,
-		client: http.DefaultClient,
-		stop:   make(chan interface{}),
+		client: &http.Client{
+			Timeout: 5 * time.Second,
+			Transport: &http.Transport{
+				DialContext: (&net.Dialer{
+					// This is the TCP connect timeout in this instance.
+					Timeout: 2500 * time.Millisecond,
+				}).DialContext,
+				TLSHandshakeTimeout: 2500 * time.Millisecond,
+			},
+		},
+		stop: make(chan interface{}),
 	}
 }
 
@@ -129,11 +156,13 @@ type Fwder struct {
 	stop chan interface{}
 }
 
-func (f *Fwder) Serve() {
+func (f *Fwder) Serve(ctx context.Context) error {
 	sub := NewSubscription(f.source)
-	super := suture.NewSimple("Fwder for " + f.source)
+	name := fmt.Sprintf("Fwder for %s to %s", f.source, f.target)
+	infof(name)
+	super := suture.NewSimple(name)
 	super.Add(sub)
-	super.ServeBackground()
+	super.ServeBackground(ctx)
 
 	for {
 		select {
@@ -141,7 +170,7 @@ func (f *Fwder) Serve() {
 			f.Forward(event)
 		case <-f.stop:
 			sub.Stop()
-			return
+			return suture.ErrTerminateSupervisorTree
 		}
 	}
 }
@@ -151,14 +180,12 @@ func (f *Fwder) Stop() {
 }
 
 func (f *Fwder) Forward(ev SSEvent) {
-	if ev.Name == "ping" || ev.Id == "" {
-		if *debugArg {
-			fmt.Printf("Received event: id=%v, name=%v, payload=%v\n", ev.Id, ev.Name, string(ev.Data))
-		}
+	if ev.Name == "ping" || ev.Id == "" || ev.Id == "0" {
+		debugf("Skipping received event: %s", ev.Format())
 		return
 	}
 
-	fmt.Printf("Received event: id=%v, name=%v, payload=%v\n", ev.Id, ev.Name, string(ev.Data))
+	infof("Received event: %s", ev.Format())
 
 	var p Payload
 	json.Unmarshal(ev.Data, &p)
@@ -172,13 +199,14 @@ func (f *Fwder) Forward(ev SSEvent) {
 
 	resp, err := f.client.Do(req)
 	if err != nil {
-		fmt.Println(err)
+		infof(err.Error())
+		return
 	}
 	defer resp.Body.Close()
 
-	if debugMode() || resp.StatusCode > 299 {
+	if resp.StatusCode > 299 {
 		b, _ := ioutil.ReadAll(resp.Body)
-		fmt.Printf("response code %s: %s\n", resp.Status, string(b))
+		debugf("response code %s: %s", resp.Status, string(b))
 	}
 }
 
@@ -201,6 +229,10 @@ type SSEvent struct {
 	Id   string
 	Name string
 	Data []byte
+}
+
+func (ev SSEvent) Format() string {
+	return fmt.Sprintf("id=%v, name=%v, payload=%v", ev.Id, ev.Name, string(ev.Data))
 }
 
 type Subscription struct {
@@ -227,46 +259,49 @@ func (s *Subscription) Stop() {
 	s.bodyToClose.Close()
 }
 
-func (s *Subscription) Serve() {
+func (s *Subscription) Serve(ctx context.Context) error {
 	req, _ := http.NewRequest("GET", s.url, nil)
 	req.Header.Set("Accept", "text/event-stream")
 	resp, err := s.client.Do(req)
 	if err != nil {
-		panic(err)
+		return err
 	}
 
 	if resp.StatusCode != 200 {
-		panic(fmt.Errorf("Error: resp.StatusCode == %d\n", resp.StatusCode))
+		return fmt.Errorf("Error: resp.StatusCode == %d\n", resp.StatusCode)
 	}
 
 	if resp.Header.Get("Content-Type") != "text/event-stream" {
-		panic(fmt.Errorf("Error: invalid Content-Type == %s\n", resp.Header.Get("Content-Type")))
+		return fmt.Errorf("Error: invalid Content-Type == %s\n", resp.Header.Get("Content-Type"))
 	}
 
 	var buf bytes.Buffer
 	ev := SSEvent{}
 	s.bodyToClose = resp.Body
 	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 512*1024), 512*1024)
 	for scanner.Scan() {
 		select {
 		case <-s.stop:
-			return
+			return suture.ErrTerminateSupervisorTree
 		default:
-			s.parseSend(scanner.Bytes(), &buf, &ev)
+			if err := s.parseSend(scanner.Bytes(), &buf, &ev); err != nil {
+				return err
+			}
 		}
 	}
 
 	if err := scanner.Err(); err != nil {
-		panic(fmt.Errorf("error during resp.Body read: %w", err))
+		infof("%s: scanner.Text(): %s", err, scanner.Text())
+		return fmt.Errorf("error during resp.Body read: %w", err)
 	}
+
+	return nil
 }
 
 // parseSend will build the event and when complete send and reset the buffer
-func (s *Subscription) parseSend(line []byte, buf *bytes.Buffer, ev *SSEvent) {
-
-	if debugMode() {
-		fmt.Printf("len: %d line: %s\n", len(line), string(line))
-	}
+func (s *Subscription) parseSend(line []byte, buf *bytes.Buffer, ev *SSEvent) error {
+	debugf("len: %d line: %s", len(line), string(line))
 
 	switch {
 
@@ -290,7 +325,8 @@ func (s *Subscription) parseSend(line []byte, buf *bytes.Buffer, ev *SSEvent) {
 		ev = &SSEvent{}
 
 	default:
-		//fmt.Fprintf(os.Stderr, "error during EventReadLoop - Default triggered! len:%d\n%s", len(line), line)
-		panic(fmt.Errorf("error during EventReadLoop - Default triggered! len:%d\n%s", len(line), line))
+		return fmt.Errorf("error during EventReadLoop - Default triggered! len:%d\n%s", len(line), line)
 	}
+
+	return nil
 }
